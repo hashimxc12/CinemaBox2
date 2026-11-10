@@ -1,16 +1,12 @@
 'use strict';
 
-// 1. البحث عبر النطاقات (Cross-Domain): إضافة نطاقات بديلة هنا
 const BASE_URLS = [
   'https://cinema.albox.co/api/v4',
-  'https://cinema2.albox.co/api/v4', // نطاق بديل (إذا وجد)
-  'https://albox.co/api/v4'          // نطاق بديل آخر
+  'https://cinema2.albox.co/api/v4'
 ];
 const CINEMETA = 'https://v3-cinemeta.strem.io';
 
-const DEFAULT_TIMEOUT = 10000;
-const MAX_RETRIES = 2;
-const RETRY_DELAY = 1000;
+const DEFAULT_TIMEOUT = 4000; // 4 ثوانٍ كحد أقصى
 
 const cache = new Map();
 
@@ -28,33 +24,23 @@ function cached(key, loader, ttl) {
   return value;
 }
 
-function fetchWithRetry(url, options, retries) {
-  if (retries == null) retries = MAX_RETRIES;
+function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(function () { controller.abort(); }, DEFAULT_TIMEOUT);
 
-  function attempt(remaining) {
-    const controller = new AbortController();
-    const timer = setTimeout(function () { controller.abort(); }, DEFAULT_TIMEOUT);
-
-    return fetch(url, Object.assign({}, options, { signal: controller.signal }))
-      .then(function (res) {
-        clearTimeout(timer);
-        return res;
-      })
-      .catch(function (err) {
-        clearTimeout(timer);
-        if (remaining > 0) {
-          return new Promise(function (resolve) {
-            setTimeout(function () { resolve(attempt(remaining - 1)); }, RETRY_DELAY);
-          });
-        }
-        throw err;
-      });
-  }
-  return attempt(retries);
+  return fetch(url, Object.assign({}, options, { signal: controller.signal }))
+    .then(function (res) {
+      clearTimeout(timer);
+      return res;
+    })
+    .catch(function (err) {
+      clearTimeout(timer);
+      throw err;
+    });
 }
 
 function request(url) {
-  return fetchWithRetry(url, {
+  return fetchWithTimeout(url, {
     headers: {
       'Accept': 'application/json',
       'User-Agent': 'Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36',
@@ -71,7 +57,6 @@ function request(url) {
   });
 }
 
-// دالة الـ API التي تجرب النطاقات بالترتيب
 function api(path, domainIndex) {
   if (domainIndex == null) domainIndex = 0;
   if (domainIndex >= BASE_URLS.length) {
@@ -80,7 +65,6 @@ function api(path, domainIndex) {
   
   var baseUrl = BASE_URLS[domainIndex];
   return request(baseUrl + '/' + path).catch(function(error) {
-    console.log('[DOMAIN FAILED]', baseUrl, '- Trying next...');
     return api(path, domainIndex + 1);
   });
 }
@@ -129,19 +113,43 @@ function getDetails(id, seasonId) {
   });
 }
 
+// 🚀 السرعة القصوى: إرسال 3 طلبات لجلب الدقة في نفس الوقت
 function getPlayer(episodeId) {
   return cached('player-' + episodeId, function () {
-    return api('shows/episodes/player/' + episodeId).then(function (data) {
-      if (!data.videos || data.videos.length === 0) {
-        return api('stream/watch/' + episodeId).catch(function () { return data; });
-      }
-      return data;
+    var endpoints = [
+      'shows/episodes/player/' + episodeId,
+      'stream/watch/' + episodeId,
+      'shows/episodes/watch/' + episodeId
+    ];
+
+    var requests = endpoints.map(function(endpoint) {
+      return api(endpoint).catch(function() { return null; });
+    });
+
+    return new Promise(function(resolve) {
+      var pending = requests.length;
+      var resolved = false;
+
+      requests.forEach(function(p) {
+        p.then(function(data) {
+          pending--;
+          if (!resolved && data && data.videos && data.videos.length > 0) {
+            resolved = true;
+            resolve(data); // أول مسار يعطي نتيجة، نأخذها فوراً
+          } else if (pending === 0 && !resolved) {
+            resolve({ videos: [] });
+          }
+        }).catch(function() {
+          pending--;
+          if (pending === 0 && !resolved) resolve({ videos: [] });
+        });
+      });
     });
   }, 30000);
 }
 
-function getExternalMeta(type, id) {
-  return cached('external-' + type + '-' + id, function () {
+function getCinemetaMeta(type, id) {
+  return cached('cinemeta-' + type + '-' + id, function () {
     return request(CINEMETA + '/meta/' + type + '/' + encodeURIComponent(id) + '.json').then(function (data) {
       return (data && data.meta) ? data.meta : { name: '', original_name: '', year: '' };
     }).catch(function () {
@@ -150,64 +158,35 @@ function getExternalMeta(type, id) {
   }, 600000);
 }
 
-function searchCinemaBox(title, type, year) {
+function searchCinemaBoxFast(title, type, year) {
   if (!title) return Promise.resolve(null);
-  return cached('search-' + type + '-' + normalizeTitle(title) + '-' + (year || ''), function () {
-    var queries = [title];
-    if (year && year !== '1900') queries.push(title + ' ' + year);
-    var foundItems = new Map();
-
-    function fetchPagesParallel(term) {
-      var pages = [1, 2, 3];
-      return Promise.all(pages.map(function (pageNum) {
-        var queryStr = 'page_size=25&page_number=' + pageNum + '&term=' + encodeURIComponent(term);
-        return api('search?' + queryStr).catch(function () { return { results: [] }; });
-      })).then(function (responses) {
-        var results = [];
-        responses.forEach(function (data) {
-          (data.results || []).forEach(function (item) {
-            if (normalizeType(item.type) === type) results.push(item);
-          });
-        });
-        return results;
-      });
-    }
-
-    function fetchAllQueries(qIndex) {
-      if (qIndex >= queries.length) return Promise.resolve(foundItems);
-      return fetchPagesParallel(queries[qIndex]).then(function (results) {
-        results.forEach(function (item) {
-          if (item.id) foundItems.set(String(item.id), item);
-        });
-        return fetchAllQueries(qIndex + 1);
-      });
-    }
-
-    return fetchAllQueries(0).then(function (items) {
-      var queryTitle = normalizeTitle(title);
-      var ranked = [];
-      items.forEach(function (item) {
-        var candidateTitle = normalizeTitle(item.title);
-        var score = titleScore(title, item.title);
-        var resultYear = releaseYear(item.year);
-
-        if (queryTitle !== candidateTitle && queryTitle.split(' ').length === 1 && candidateTitle.split(' ').length > 1) score = 0;
-        if (year && resultYear && resultYear !== '1900') {
-          if (year === resultYear) score += 0.1;
-          else score -= 0.1;
-        }
-        ranked.push({ item: item, score: score });
-      });
-      ranked.sort(function (a, b) { return b.score - a.score; });
-
-      var best = ranked[0];
-      if (best && best.score >= 0.50) {
-        console.log('[MATCH]', title, '=>', best.item.title, 'ID:', best.item.id);
-        return best.item;
-      }
-      return null;
+  var queryStr = 'page_size=25&page_number=1&term=' + encodeURIComponent(title);
+  
+  return api('search?' + queryStr).then(function (data) {
+    var results = (data.results || []).filter(function (item) {
+      return normalizeType(item.type) === type;
     });
-  }, 600000);
+    
+    var queryTitle = normalizeTitle(title);
+    var ranked = [];
+    results.forEach(function (item) {
+      var candidateTitle = normalizeTitle(item.title);
+      var score = titleScore(title, item.title);
+      var resultYear = releaseYear(item.year);
+
+      if (queryTitle !== candidateTitle && queryTitle.split(' ').length === 1 && candidateTitle.split(' ').length > 1) score = 0;
+      if (year && resultYear && resultYear !== '1900') {
+        if (year === resultYear) score += 0.1;
+        else score -= 0.1;
+      }
+      ranked.push({ item: item, score: score });
+    });
+    ranked.sort(function (a, b) { return b.score - a.score; });
+
+    var best = ranked[0];
+    if (best && best.score >= 0.50) return best.item;
+    return null;
+  }).catch(function () { return null; });
 }
 
 function parseExternalId(id) {
@@ -327,120 +306,52 @@ function cleanAndSortStreams(streams) {
   return unique;
 }
 
-function fetchStreams(type, id, searchTitles) {
-  var episodeId = null;
-  var external = parseExternalId(id);
-
-  if (!external) return Promise.resolve({ streams: [] });
-
-  return getExternalMeta(type, external.imdbId).then(function (meta) {
-    var year = releaseYear(meta.year);
-    var allTitles = [];
-    
-    if (searchTitles && searchTitles.length) {
-      searchTitles.forEach(function (t) { if (allTitles.indexOf(t) === -1) allTitles.push(t); });
-    }
-    if (meta.name && allTitles.indexOf(meta.name) === -1) allTitles.push(meta.name);
-    if (meta.original_name && allTitles.indexOf(meta.original_name) === -1) allTitles.push(meta.original_name);
-
-    function trySearchTitle(index) {
-      if (index >= allTitles.length) return Promise.resolve(null);
-      console.log('[SEARCHING]', allTitles[index]);
-      return searchCinemaBox(allTitles[index], type, year).then(function (found) {
-        if (found) return found;
-        return trySearchTitle(index + 1);
-      });
-    }
-    return trySearchTitle(0);
-  })
-  .then(function (found) {
-    if (!found) return null;
-    return getDetails(found.id).then(function (details) {
-      var post = details.post_info;
-      if (!post) return null;
-      if (type === 'movie') {
-        episodeId = post.episode_id;
-        return episodeId;
-      }
-      if (!external.season || !external.episode) return null;
-      return findEpisode(details, found.id, external.season, external.episode);
-    });
-  })
-  .then(function (resolvedEpisodeId) {
-    episodeId = resolvedEpisodeId;
-    if (!episodeId) return { streams: [] };
-
-    return getPlayer(episodeId).then(function (player) {
-      var streams = [];
-      (player.videos || []).forEach(function (video) {
-        if (video.url && /^https?:\/\//i.test(video.url)) {
-          streams.push(buildStreamObject(video));
-        }
-      });
-      streams = cleanAndSortStreams(streams);
-      console.log('[STREAMS]', type, id, 'count:', streams.length);
-      return { streams: streams };
-    });
-  })
-  .catch(function (error) {
-    console.error('[STREAM ERROR]', error.message);
-    return { streams: [] };
-  });
-}
-
 function getStreamsForNuvio(input, mediaType, season, episode) {
   return Promise.resolve().then(function () {
     var args = input && typeof input === 'object' ? input : { tmdbId: input, mediaType: mediaType, season: season, episode: episode };
     var rawType = String(args.mediaType || 'movie').toLowerCase();
     var oldType = rawType === 'tv' ? 'series' : rawType;
-
-    var tmdbTitles = [];
     var tmdbId = args.tmdbId;
     var apiKey = typeof TMDB_API_KEY !== 'undefined' ? TMDB_API_KEY : '';
+    var isImdb = String(tmdbId).startsWith('tt');
 
-    // 2. المحقق الذكي (Smart Title Detector): جلب الأسماء بكل اللغات المتاحة
-    var tmdbPromise = Promise.resolve();
-    if (apiKey && !String(tmdbId).startsWith('tt')) {
-      var kind = (rawType === 'tv' || rawType === 'series') ? 'tv' : 'movie';
+    var titles = [];
+    var year = null;
+    var metaPromise;
+
+    // 🚀 تخطي Cinemeta إذا استخدمنا TMDB لتسريع العملية
+    if (!isImdb && apiKey) {
+      var kind = (oldType === 'series') ? 'tv' : 'movie';
       var baseUrl = 'https://api.themoviedb.org/3/' + kind + '/' + encodeURIComponent(tmdbId);
       
-      var requests = [
+      var reqs = [
         request(baseUrl + '?api_key=' + apiKey + '&language=ar').catch(function(){ return {}; }),
-        request(baseUrl + '?api_key=' + apiKey + '&language=en').catch(function(){ return {}; }),
-        request(baseUrl + '/alternative_titles?api_key=' + apiKey).catch(function(){ return { titles: [] }; })
+        request(baseUrl + '?api_key=' + apiKey + '&language=en').catch(function(){ return {}; })
       ];
 
-      tmdbPromise = Promise.all(requests).then(function(results) {
+      metaPromise = Promise.all(reqs).then(function(results) {
         var ar = results[0] || {};
         var en = results[1] || {};
-        var alt = results[2] || {};
-
-        // إضافة الأسماء العربية
-        if (ar.name) tmdbTitles.push(ar.name);
-        if (ar.title) tmdbTitles.push(ar.title);
-        if (ar.original_name) tmdbTitles.push(ar.original_name);
-        if (ar.original_title) tmdbTitles.push(ar.original_title);
-
-        // إضافة الأسماء الإنجليزية
-        if (en.name) tmdbTitles.push(en.name);
-        if (en.title) tmdbTitles.push(en.title);
         
-        // إضافة الأسماء البديلة (مثل التركية، الكردية، إلخ)
-        if (alt.titles && alt.titles.length) {
-          alt.titles.forEach(function(t) {
-            if (t.title) tmdbTitles.push(t.title);
-          });
-        }
+        if (ar.name) titles.push(ar.name);
+        if (ar.title) titles.push(ar.title);
+        if (en.name) titles.push(en.name);
+        if (en.title) titles.push(en.title);
         
-        // تصفية المكرر
-        tmdbTitles = tmdbTitles.filter(function(item, pos) {
-            return tmdbTitles.indexOf(item) == pos;
-        });
-        console.log('[TMDB TITLES FOUND]', tmdbTitles.length);
+        titles = titles.filter(function(item, pos) { return titles.indexOf(item) == pos; });
+        var date = ar.release_date || ar.first_air_date || en.release_date || en.first_air_date;
+        if (date) year = date.split('-')[0];
+      });
+    } else {
+      // إذا كان IMDb، نستخدم Cinemeta
+      metaPromise = getCinemetaMeta(oldType, tmdbId).then(function(meta) {
+        if (meta.name) titles.push(meta.name);
+        if (meta.original_name) titles.push(meta.original_name);
+        year = releaseYear(meta.year);
       });
     }
 
-    return tmdbPromise.then(function () {
+    return metaPromise.then(function () {
       return resolveImdbId(tmdbId, rawType);
     }).then(function (imdbId) {
       if (!imdbId) return [];
@@ -449,9 +360,61 @@ function getStreamsForNuvio(input, mediaType, season, episode) {
         if (args.season == null || args.episode == null) return [];
         id += ':' + Number(args.season) + ':' + Number(args.episode);
       }
-      return fetchStreams(oldType, id, tmdbTitles).then(function (result) {
-        return Array.isArray(result && result.streams) ? result.streams : [];
+      
+      var external = parseExternalId(id);
+      if (!external) return [];
+
+      // البحث المتوازي بكل الأسماء المتاحة
+      var searchPromises = titles.map(function(t) {
+        return searchCinemaBoxFast(t, oldType, year);
       });
+
+      return new Promise(function(resolve) {
+        var resolved = false;
+        var pending = searchPromises.length;
+        if (pending === 0) return resolve(null);
+
+        searchPromises.forEach(function(p) {
+          p.then(function(found) {
+            if (!resolved && found) {
+              resolved = true;
+              resolve(found);
+            } else if (!found) {
+              pending--;
+              if (pending === 0 && !resolved) resolve(null);
+            }
+          }).catch(function() {
+            pending--;
+            if (pending === 0 && !resolved) resolve(null);
+          });
+        });
+      });
+    }).then(function (found) {
+      if (!found) return null;
+      return getDetails(found.id).then(function (details) {
+        var post = details.post_info;
+        if (!post) return null;
+        if (oldType === 'movie') return post.episode_id;
+        
+        var external = parseExternalId(String(tmdbId).includes(':') ? tmdbId : tmdbId + ':' + season + ':' + episode);
+        if (!external || !external.season || !external.episode) return null;
+        return findEpisode(details, found.id, external.season, external.episode);
+      });
+    }).then(function (episodeId) {
+      if (!episodeId) return { streams: [] };
+
+      return getPlayer(episodeId).then(function (player) {
+        var streams = [];
+        (player.videos || []).forEach(function (video) {
+          if (video.url && /^https?:\/\//i.test(video.url)) {
+            streams.push(buildStreamObject(video));
+          }
+        });
+        streams = cleanAndSortStreams(streams);
+        return { streams: streams };
+      });
+    }).then(function(result) {
+      return Array.isArray(result && result.streams) ? result.streams : [];
     });
   }).catch(function (error) {
     console.error('[NUVIO ERROR]', error);
