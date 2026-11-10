@@ -19,26 +19,22 @@ function cached(key, loader, ttl) {
   return value;
 }
 
-function request(url) {
-  return fetch(url, {
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36',
-      'Referer': 'https://cinema.albox.co/',
-      'Origin': 'https://cinema.albox.co',
-      'Accept-Language': 'en-US,en;q=0.9'
-    }
-  })
+function request(url, options) {
+  var headers = {
+    'Accept': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36',
+    'Referer': 'https://cinema.albox.co/',
+    'Origin': 'https://cinema.albox.co',
+    'Accept-Language': 'en-US,en;q=0.9'
+  };
+  if (options && options.headers) {
+    Object.keys(options.headers).forEach(function(k) { headers[k] = options.headers[k]; });
+  }
+  return fetch(url, { headers: headers })
   .then(function (response) {
     return response.text().then(function (body) {
-      if (!response.ok) {
-        throw new Error('HTTP ' + response.status + ': ' + url + ' | BODY: ' + body.slice(0, 700));
-      }
-      try {
-        return JSON.parse(body);
-      } catch (e) {
-        throw new Error('Invalid JSON from ' + url + ': ' + body.slice(0, 300));
-      }
+      if (!response.ok) throw new Error('HTTP ' + response.status + ': ' + url);
+      try { return JSON.parse(body); } catch (e) { throw new Error('Invalid JSON'); }
     });
   });
 }
@@ -51,7 +47,6 @@ function normalizeType(value) {
   return String(value || '').toUpperCase() === 'MOVIE' ? 'movie' : 'series';
 }
 
-// دالة آمنة لتنظيف النصوص تدعم العربية بدون استخدام normalize
 function normalizeTitle(value) {
   return String(value || '')
     .toLowerCase()
@@ -80,9 +75,7 @@ function titleScore(a, b) {
 function releaseYear(value) {
   if (!value) return undefined;
   var number = Number(value);
-  if (Number.isFinite(number) && number > 1000000000) {
-    return String(new Date(number).getFullYear());
-  }
+  if (Number.isFinite(number) && number > 1000000000) return String(new Date(number).getFullYear());
   var match = String(value).match(/\b(19|20)\d{2}\b/);
   return match ? match[0] : undefined;
 }
@@ -97,23 +90,35 @@ function getDetails(id, seasonId) {
 
 function getPlayer(episodeId) {
   return cached('player-' + episodeId, function () {
-    return api('shows/episodes/player/' + episodeId);
+    // تجربة نقطة النهاية القديمة أولاً
+    return api('shows/episodes/player/' + episodeId).then(function(data) {
+      // إذا لم تكن هناك روابط، نجرب نقطة النهاية الجديدة
+      if (!data.videos || data.videos.length === 0) {
+        console.log('[TRYING WATCH ENDPOINT]');
+        return api('stream/watch/' + episodeId).catch(function() {
+          return data; // إرجاع البيانات القديمة حتى لو فارغة
+        });
+      }
+      return data;
+    });
   }, 30000);
 }
 
 function getExternalMeta(type, id) {
   return cached('external-' + type + '-' + id, function () {
     return request(CINEMETA + '/meta/' + type + '/' + encodeURIComponent(id) + '.json').then(function (data) {
-      if (!data.meta || !data.meta.name) throw new Error('No external metadata for ' + id);
-      return data.meta;
+      return (data && data.meta) ? data.meta : { name: '', original_name: '', year: '' };
+    }).catch(function() {
+      return { name: '', original_name: '', year: '' };
     });
   }, 600000);
 }
 
 function searchCinemaBox(title, type, year) {
+  if (!title) return Promise.resolve(null);
   return cached('search-' + type + '-' + normalizeTitle(title) + '-' + (year || ''), function () {
     var queries = [title];
-    if (year) queries.push(title + ' ' + year);
+    if (year && year !== '1900') queries.push(title + ' ' + year);
     var foundItems = new Map();
 
     function fetchAllQueries(qIndex) {
@@ -122,10 +127,7 @@ function searchCinemaBox(title, type, year) {
 
       function fetchPage(pageNum) {
         if (pageNum > 5) return Promise.resolve();
-        
-        // استبدلنا URLSearchParams بنص عادي لتجنب مشاكل Hermes
         var queryStr = 'page_size=25&page_number=' + pageNum + '&term=' + encodeURIComponent(term);
-        
         return api('search?' + queryStr).then(function (data) {
           var results = (data.results || []).filter(function (item) {
             return normalizeType(item.type) === type;
@@ -137,10 +139,7 @@ function searchCinemaBox(title, type, year) {
           return fetchPage(pageNum + 1);
         }).catch(function() { return Promise.resolve(); });
       }
-
-      return fetchPage(1).then(function () {
-        return fetchAllQueries(qIndex + 1);
-      });
+      return fetchPage(1).then(function () { return fetchAllQueries(qIndex + 1); });
     }
 
     return fetchAllQueries(0).then(function (items) {
@@ -151,9 +150,7 @@ function searchCinemaBox(title, type, year) {
         var score = titleScore(title, item.title);
         var resultYear = releaseYear(item.year);
 
-        if (queryTitle !== candidateTitle && queryTitle.split(' ').length === 1 && candidateTitle.split(' ').length > 1) {
-          score = 0;
-        }
+        if (queryTitle !== candidateTitle && queryTitle.split(' ').length === 1 && candidateTitle.split(' ').length > 1) score = 0;
         
         if (year && resultYear && resultYear !== '1900') {
           if (year === resultYear) score += 0.1;
@@ -165,10 +162,9 @@ function searchCinemaBox(title, type, year) {
 
       var best = ranked[0];
       if (best && best.score >= 0.50) {
-        console.log('[MATCH]', title, '=>', best.item.title, 'ID:', best.item.id, 'score:', best.score.toFixed(2));
+        console.log('[MATCH]', title, '=>', best.item.title, 'ID:', best.item.id);
         return best.item;
       }
-      console.log('[NOT FOUND]', title, year, type);
       return null;
     });
   }, 600000);
@@ -193,32 +189,21 @@ function findEpisode(details, showId, seasonNumber, episodeNumber) {
     var seasonCards = [];
     (details.sections || []).forEach(function (section) {
       (section.data || []).forEach(function (item) {
-        if (String(item.card_type || '').toLowerCase() === 'seasonposter' && item.id) {
-          seasonCards.push(item);
-        }
+        if (String(item.card_type || '').toLowerCase() === 'seasonposter' && item.id) seasonCards.push(item);
       });
     });
 
     var seasonCard = null;
     for (var i = 0; i < seasonCards.length; i++) {
       var match = String(seasonCards[i].title || '').match(/\d+/);
-      if (match && Number(match[0]) === seasonNumber) {
-        seasonCard = seasonCards[i];
-        break;
-      }
+      if (match && Number(match[0]) === seasonNumber) { seasonCard = seasonCards[i]; break; }
     }
 
-    if (!seasonCard) {
-      console.log('[SEASON NOT AVAILABLE]', 'requested:', seasonNumber);
-      return Promise.resolve(null);
-    }
+    if (!seasonCard) return Promise.resolve(null);
 
     seasonPromise = getDetails(showId, seasonCard.id).then(function (loaded) {
       var loadedSeason = Number((loaded.post_info && loaded.post_info.season_number) || 0);
-      if (loadedSeason !== seasonNumber) {
-        console.log('[SEASON LOAD MISMATCH]', 'requested:', seasonNumber, 'loaded:', loadedSeason);
-        return null;
-      }
+      if (loadedSeason !== seasonNumber) return null;
       return loaded;
     });
   }
@@ -237,9 +222,7 @@ function findEpisode(details, showId, seasonNumber, episodeNumber) {
     var episodes = [];
     if (section) {
       (section.data || []).forEach(function (item) {
-        if (item.id && String(item.card_type || '').toLowerCase() === 'episode') {
-          episodes.push(item);
-        }
+        if (item.id && String(item.card_type || '').toLowerCase() === 'episode') episodes.push(item);
       });
     }
 
@@ -264,26 +247,32 @@ function resolveImdbId(id, mediaType) {
     .then(function (data) { return data && data.imdb_id ? data.imdb_id : null; });
 }
 
-function fetchStreams(type, id) {
+function fetchStreams(type, id, tmdbTitles) {
   var episodeId = null;
   var external = parseExternalId(id);
 
-  if (!external) {
-    console.log('[UNSUPPORTED ID]', type, id);
-    return Promise.resolve({ streams: [] });
-  }
+  if (!external) return Promise.resolve({ streams: [] });
 
   return getExternalMeta(type, external.imdbId).then(function (meta) {
     var year = releaseYear(meta.year);
     
-    return searchCinemaBox(meta.name, type, year).then(function (found) {
-      if (found) return found;
-      if (meta.original_name && meta.original_name !== meta.name) {
-        console.log('[RETRY WITH ARABIC]', meta.original_name);
-        return searchCinemaBox(meta.original_name, type, year);
-      }
-      return null;
-    });
+    var allTitles = [];
+    if (tmdbTitles && tmdbTitles.length) {
+        tmdbTitles.forEach(function(t) { if (allTitles.indexOf(t) === -1) allTitles.push(t); });
+    }
+    if (meta.name && allTitles.indexOf(meta.name) === -1) allTitles.push(meta.name);
+    if (meta.original_name && allTitles.indexOf(meta.original_name) === -1) allTitles.push(meta.original_name);
+    
+    function trySearchTitle(index) {
+        if (index >= allTitles.length) return Promise.resolve(null);
+        console.log('[SEARCHING WITH TITLE]', allTitles[index]);
+        return searchCinemaBox(allTitles[index], type, year).then(function (found) {
+            if (found) return found;
+            return trySearchTitle(index + 1);
+        });
+    }
+    
+    return trySearchTitle(0);
   })
   .then(function (found) {
     if (!found) return null;
@@ -295,66 +284,78 @@ function fetchStreams(type, id) {
         episodeId = post.episode_id;
         return episodeId;
       }
-
       if (!external.season || !external.episode) return null;
       return findEpisode(details, found.id, external.season, external.episode);
     });
   })
   .then(function (resolvedEpisodeId) {
     episodeId = resolvedEpisodeId;
-    if (!episodeId) {
-      console.log('[NO EPISODE ID]', type, id);
-      return { streams: [] };
-    }
+    if (!episodeId) return { streams: [] };
 
     return getPlayer(episodeId).then(function (player) {
       var streams = [];
       (player.videos || []).forEach(function (video) {
         if (video.url && /^https?:\/\//i.test(video.url)) {
           var quality = video.quality || 'Video';
-          streams.push({
-            name: 'Cinema Box · ' + quality,
-            title: quality + ' • Cinema Box',
-            url: video.url
-          });
+          streams.push({ name: 'Cinema Box · ' + quality, title: quality + ' • Cinema Box', url: video.url });
         }
       });
-      console.log('[STREAMS]', type, id, 'episode:', episodeId, 'count:', streams.length);
       return { streams: streams };
     });
   })
   .catch(function (error) {
-    console.error('[STREAM ERROR]', type, id, error.message);
+    console.error('[STREAM ERROR]', error.message);
     return { streams: [] };
   });
 }
 
 function getStreamsForNuvio(input, mediaType, season, episode) {
   return Promise.resolve().then(function () {
-    var args = input && typeof input === 'object'
-      ? input
-      : { tmdbId: input, mediaType: mediaType, season: season, episode: episode };
-
+    var args = input && typeof input === 'object' ? input : { tmdbId: input, mediaType: mediaType, season: season, episode: episode };
     var rawType = String(args.mediaType || 'movie').toLowerCase();
     var oldType = rawType === 'tv' ? 'series' : rawType;
+    
+    var tmdbTitles = [];
+    var tmdbId = args.tmdbId;
+    var apiKey = typeof TMDB_API_KEY !== 'undefined' ? TMDB_API_KEY : '';
 
-    return resolveImdbId(args.tmdbId, rawType).then(function (imdbId) {
+    // 1. جلب الاسم العربي من TMDB مباشرة
+    var tmdbPromise = Promise.resolve();
+    if (apiKey) {
+        var kind = (rawType === 'tv' || rawType === 'series') ? 'tv' : 'movie';
+        var tmdbUrl = 'https://api.themoviedb.org/3/' + kind + '/' + encodeURIComponent(tmdbId) + '?api_key=' + encodeURIComponent(apiKey) + '&language=ar';
+        tmdbPromise = request(tmdbUrl).then(function(data) {
+            if (data.name) tmdbTitles.push(data.name);
+            if (data.original_name && data.original_name !== data.name) tmdbTitles.push(data.original_name);
+            if (data.title) tmdbTitles.push(data.title);
+            if (data.original_title && data.original_title !== data.title) tmdbTitles.push(data.original_title);
+        }).catch(function(e) { 
+            console.log('[TMDB TITLE ERROR]', e.message); 
+        });
+    }
+
+    return tmdbPromise.then(function() {
+        return resolveImdbId(tmdbId, rawType);
+    }).then(function (imdbId) {
       if (!imdbId) return [];
-
       var id = imdbId;
       if (oldType === 'series') {
         if (args.season == null || args.episode == null) return [];
         id += ':' + Number(args.season) + ':' + Number(args.episode);
       }
-
-      return fetchStreams(oldType, id).then(function (result) {
+      return fetchStreams(oldType, id, tmdbTitles).then(function (result) {
         return Array.isArray(result && result.streams) ? result.streams : [];
       });
     });
   }).catch(function (error) {
-    console.error('[CINEMA BOX NUVIO]', error);
+    console.error('[NUVIO ERROR]', error);
     return [];
   });
 }
 
-module.exports = { getStreams: getStreamsForNuvio };
+// تصدير متوافق مع Nuvio (Promise-based)
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { getStreams: getStreamsForNuvio };
+} else {
+  global.getStreams = getStreamsForNuvio;
+}
