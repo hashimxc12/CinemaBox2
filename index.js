@@ -51,13 +51,15 @@ function normalizeType(value) {
   return String(value || '').toUpperCase() === 'MOVIE' ? 'movie' : 'series';
 }
 
+// دالة آمنة لتنظيف النصوص تدعم العربية بدون استخدام normalize
 function normalizeTitle(value) {
   return String(value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
     .replace(/&/g, ' and ')
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/[^a-z0-9\u0600-\u06ff]+/g, ' ')
     .trim()
     .replace(/\s+/g, ' ');
 }
@@ -117,16 +119,14 @@ function searchCinemaBox(title, type, year) {
     function fetchAllQueries(qIndex) {
       if (qIndex >= queries.length) return Promise.resolve(foundItems);
       var term = queries[qIndex];
-      var pages = [];
 
       function fetchPage(pageNum) {
-        if (pageNum > 10) return Promise.resolve();
-        var params = new URLSearchParams({
-          page_size: '25',
-          page_number: String(pageNum),
-          term: term
-        });
-        return api('search?' + params.toString()).then(function (data) {
+        if (pageNum > 5) return Promise.resolve();
+        
+        // استبدلنا URLSearchParams بنص عادي لتجنب مشاكل Hermes
+        var queryStr = 'page_size=25&page_number=' + pageNum + '&term=' + encodeURIComponent(term);
+        
+        return api('search?' + queryStr).then(function (data) {
           var results = (data.results || []).filter(function (item) {
             return normalizeType(item.type) === type;
           });
@@ -135,7 +135,7 @@ function searchCinemaBox(title, type, year) {
           });
           if ((data.results || []).length < 25) return Promise.resolve();
           return fetchPage(pageNum + 1);
-        });
+        }).catch(function() { return Promise.resolve(); });
       }
 
       return fetchPage(1).then(function () {
@@ -154,16 +154,17 @@ function searchCinemaBox(title, type, year) {
         if (queryTitle !== candidateTitle && queryTitle.split(' ').length === 1 && candidateTitle.split(' ').length > 1) {
           score = 0;
         }
-        if (year && resultYear) {
-          if (year === resultYear) score += 0.08;
-          else score -= 0.12;
+        
+        if (year && resultYear && resultYear !== '1900') {
+          if (year === resultYear) score += 0.1;
+          else score -= 0.1;
         }
         ranked.push({ item: item, score: score });
       });
       ranked.sort(function (a, b) { return b.score - a.score; });
 
       var best = ranked[0];
-      if (best && best.score >= 0.72) {
+      if (best && best.score >= 0.50) {
         console.log('[MATCH]', title, '=>', best.item.title, 'ID:', best.item.id, 'score:', best.score.toFixed(2));
         return best.item;
       }
@@ -186,7 +187,6 @@ function parseExternalId(id) {
 function findEpisode(details, showId, seasonNumber, episodeNumber) {
   var seasonDetails = details;
   var currentSeason = Number((details.post_info && details.post_info.season_number) || 1);
-
   var seasonPromise = Promise.resolve(seasonDetails);
 
   if (seasonNumber !== currentSeason) {
@@ -275,7 +275,15 @@ function fetchStreams(type, id) {
 
   return getExternalMeta(type, external.imdbId).then(function (meta) {
     var year = releaseYear(meta.year);
-    return searchCinemaBox(meta.name, type, year);
+    
+    return searchCinemaBox(meta.name, type, year).then(function (found) {
+      if (found) return found;
+      if (meta.original_name && meta.original_name !== meta.name) {
+        console.log('[RETRY WITH ARABIC]', meta.original_name);
+        return searchCinemaBox(meta.original_name, type, year);
+      }
+      return null;
+    });
   })
   .then(function (found) {
     if (!found) return null;

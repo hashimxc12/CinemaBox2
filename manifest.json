@@ -1,7 +1,7 @@
 {
   "id": "cinemabox",
   "name": "Cinema Box",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Cinema Box direct movie and TV episode streams",
   "author": "Community",
   "scrapers": [
@@ -9,7 +9,7 @@
       "id": "cinemabox",
       "name": "Cinema Box",
       "description": "Cinema Box movie and series sources",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "filename": "index.js",
       "supportedTypes": ["movie", "tv"],
       "enabled": true,
